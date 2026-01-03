@@ -42,47 +42,62 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
     - Finds \n\n separators to identify step boundaries
     - Isolates Step 2 in the attention mask
     - Extracts embeddings at predictor token and Step 2 end
+    
+    When step_jepa=False:
+    - Uses original LLM-JEPA logic (Text ↔ Code)
     """
     
     def __init__(self, *args, **kwargs):
-        # Extract Step-JEPA specific parameters
+        # Extract Step-JEPA specific parameters before calling super().__init__
         self.step_jepa = kwargs.pop('step_jepa', False)
+        self.step_jepa_predictors = kwargs.pop('step_jepa_predictors', 1)  # K predictor tokens after Step 1
+        
+        # Pass all other parameters to parent, including last_token, jepa_ratio
         super().__init__(*args, **kwargs)
         
         if self.step_jepa:
-            print("✅ Step-JEPA mode enabled")
-            # Add predictor token to tokenizer if needed
-            self.predictor_token = "<|predictor|>"
+            print(f"✅ Step-JEPA mode enabled: Will isolate Step 2, K={self.step_jepa_predictors} predictor tokens")
+        else:
+            print("ℹ️  Using base RepresentationTrainer (additive_mask logic from finetune.py)")
     
     def _find_step_boundaries(self, input_ids, processing_class):
         """
-        Find positions where Step 1 and Step 2 end by looking for \n\n separators.
+        Find positions of \n\n markers that represent step boundaries.
+        
+        In step-based reasoning, \n\n serves as THE representation point for each step.
+        We extract embeddings AT the \n\n position (not after it).
         
         Returns:
-            step1_end: Position after first \n\n
-            step2_end: Position after second \n\n
+            step1_end: Position of \n\n after Step 1 (last token if \n\n spans multiple tokens)
+            step2_end: Position of \n\n after Step 2 (last token if \n\n spans multiple tokens)
             Returns None, None if can't find boundaries
+            
+        Note: Predictor tokens will be inserted RIGHT AFTER step1_end.
         """
-        # Tokenize the separator
+        # Tokenize the separator - this is THE representation marker for each step
         sep_tokens = processing_class.encode("\n\n", add_special_tokens=False)
         
         # Convert to list for searching
         ids_list = input_ids.tolist()
         
-        # Find first occurrence (after Step 1)
+        # Find first \n\n (THE representation point of Step 1)
         step1_end = None
         for i in range(len(ids_list) - len(sep_tokens) + 1):
             if ids_list[i:i+len(sep_tokens)] == sep_tokens:
+                # Position of last token in \n\n sequence
+                # This is THE embedding extraction point for Step 1
                 step1_end = i + len(sep_tokens) - 1
                 break
         
         if step1_end is None:
             return None, None
         
-        # Find second occurrence (after Step 2)
+        # Find second \n\n (THE representation point of Step 2)
         step2_end = None
         for i in range(step1_end + len(sep_tokens), len(ids_list) - len(sep_tokens) + 1):
             if ids_list[i:i+len(sep_tokens)] == sep_tokens:
+                # Position of last token in \n\n sequence
+                # This is THE embedding extraction point for Step 2
                 step2_end = i + len(sep_tokens) - 1
                 break
         
@@ -91,15 +106,21 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         
         return step1_end, step2_end
     
-    def _build_step_jepa_mask(self, seq_len, step1_end_pos, step2_end_pos, device):
+    def _build_step_jepa_mask(self, seq_len, step1_end_pos, step2_end_pos, num_predictors, device):
         """
         Build attention mask for Step-JEPA.
         
-        Pattern:
-        - [0:step1_end+1]: Normal causal (System, User, Step1)
-        - [step1_end+1]: Predictor position (normal causal)
-        - [step1_end+2:step2_end+1]: Step 2 ISOLATED (only see themselves)
-        - [step2_end+1:]: Step 3+ normal causal (see everything including Step 2)
+        Key insight: \n\n is THE representation marker for each step (common in step-based reasoning).
+        
+        Pattern with K predictor tokens:
+        - [0:step1_end+1]: Normal causal (System, User, Step1, \n\n)
+        - [step1_end+1:step1_end+1+K]: K predictor tokens RIGHT AFTER \n\n (normal causal)
+        - [step1_end+1+K:step2_end+1+K]: Step 2 content + \n\n ISOLATED (only see themselves)
+        - [step2_end+1+K:]: Step 3+ normal causal (see everything including Step 2)
+        
+        Embedding extraction:
+        - View 1: h[step1_end + K] = last predictor (predicts Step 2 from Step 1's \n\n)
+        - View 2: h[step2_end + K] = Step 2's \n\n (THE representation of Step 2)
         
         Returns:
             mask: [batch_size, 1, seq_len, seq_len]
@@ -117,12 +138,16 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
             step1_end = step1_end_pos[i].item()
             step2_end = step2_end_pos[i].item()
             
-            # Predictor goes right after step1_end
-            predictor_pos = step1_end + 1
-            step2_start = predictor_pos + 1
+            # K predictor tokens go after step1_end
+            predictor_start = step1_end + 1
+            predictor_end = predictor_start + num_predictors - 1
+            step2_start = predictor_end + 1
+            
+            # Adjust step2_end to account for inserted predictors
+            step2_end_adjusted = step2_end + num_predictors
             
             # Isolate Step 2: can't see anything before it
-            mask[i, 0, step2_start:step2_end+1, :step2_start] = float('-inf')
+            mask[i, 0, step2_start:step2_end_adjusted+1, :step2_start] = float('-inf')
             
             # Step 3+ has normal causal (no additional masking needed)
         
@@ -132,11 +157,11 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         """
         Override parent's method to support Step-JEPA masking.
         
-        If step_jepa is False, use parent's implementation.
+        If step_jepa is False, use parent's implementation (default additive_mask from finetune.py).
         If step_jepa is True, apply Step-JEPA attention masking.
         """
         if not self.step_jepa:
-            # Use original LLM-JEPA logic
+            # Use parent's default additive_mask logic from finetune.py
             return super().build_with_additive_mask(inputs)
         
         # Step-JEPA logic
@@ -170,17 +195,40 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         step1_end_pos = torch.tensor(step1_end_positions, device=device)
         step2_end_pos = torch.tensor(step2_end_positions, device=device)
         
+        # Insert K predictor tokens after Step 1 for each example
+        # We need to modify input_ids to insert the predictor tokens
+        predictor_token_id = self.processing_class.convert_tokens_to_ids("<|predictor_1|>")
+        
+        # Create new input_ids with predictor tokens inserted
+        new_input_ids = []
+        for i in range(batch_size):
+            step1_end = step1_end_pos[i].item()
+            # Insert K predictor tokens after step1_end
+            predictor_ids = [self.processing_class.convert_tokens_to_ids(f"<|predictor_{j+1}|>") 
+                            for j in range(self.step_jepa_predictors)]
+            
+            new_seq = torch.cat([
+                inputs["input_ids"][i, :step1_end+1],
+                torch.tensor(predictor_ids, device=device),
+                inputs["input_ids"][i, step1_end+1:]
+            ])
+            new_input_ids.append(new_seq[:seq_length])  # Truncate to original length
+        
+        new_input_ids = torch.stack(new_input_ids)
+        
         # Build Step-JEPA mask
-        mask = self._build_step_jepa_mask(seq_length, step1_end_pos, step2_end_pos, device)
+        mask = self._build_step_jepa_mask(seq_length, step1_end_pos, step2_end_pos, 
+                                         self.step_jepa_predictors, device)
         
         # Store for later use in compute_loss
         self._step1_end_pos = step1_end_pos
-        self._step2_end_pos = step2_end_pos
-        self._predictor_pos = step1_end_pos + 1  # Predictor right after Step 1
+        self._step2_end_pos = step2_end_pos + self.step_jepa_predictors  # Adjust for inserted tokens
+        # Extract embedding at LAST predictor token
+        self._predictor_pos = step1_end_pos + self.step_jepa_predictors
         
         return {
-            "input_ids": inputs["input_ids"],
-            "labels": inputs["labels"],
+            "input_ids": new_input_ids,
+            "labels": inputs["labels"],  # Labels stay the same (we don't predict predictor tokens)
             "attention_mask": mask,
         }, False
     
@@ -255,23 +303,37 @@ def main():
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank")
     
     # Step-JEPA arguments
-    parser.add_argument("--step_jepa", action="store_true", help="Enable Step-JEPA mode")
+    parser.add_argument("--step_jepa", action="store_true", help="Enable Step-JEPA mode (isolate Step 2)")
+    parser.add_argument("--regular", action="store_true", help="Use regular trainer without JEPA")
+    parser.add_argument("--predictors", type=int, default=1, help="Number of K predictor tokens after Step 1")
     parser.add_argument("--lbd", type=float, default=0.1, help="Lambda for JEPA loss")
     parser.add_argument("--gamma", type=float, default=1.0, help="Gamma for LM loss")
+    parser.add_argument("--last_token", type=int, default=-1, help="Index of last token for embedding extraction")
     parser.add_argument("--jepa_l2", action="store_true", help="Use L2 norm as JEPA loss")
     parser.add_argument("--jepa_mse", action="store_true", help="Use MSE as JEPA loss")
     parser.add_argument("--infonce", action="store_true", help="Use InfoNCE loss")
+    parser.add_argument("--jepa_ratio", type=float, default=-1.0, help="Random JEPA loss dropout ratio")
     
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--finetune_seed", type=int, default=42, help="Finetune random seed (alias for seed)")
     parser.add_argument("--debug", type=int, default=0, help="Debug level")
     
     args = parser.parse_args()
     
+    # Use finetune_seed if provided (matches finetune.py)
+    if args.finetune_seed != 42:
+        args.seed = args.finetune_seed
+    
     # Validate
-    if not args.step_jepa:
-        print("⚠️  Warning: --step_jepa not set. This will use standard LLM-JEPA instead of Step-JEPA.")
-        print("   Add --step_jepa flag to enable Step-JEPA mode.")
+    if args.regular and args.step_jepa:
+        parser.error("Cannot use both --regular and --step_jepa. Choose one.")
+    
+    if not args.step_jepa and not args.regular and args.predictors == 1:
+        # Default predictors to 1 for Step-JEPA, keep for backwards compatibility
+        print("⚠️  Warning: Neither --step_jepa nor --regular specified.")
+        print("   Will use base RepresentationTrainer from finetune.py.")
+        print("   Add --step_jepa for Step-JEPA or --regular for no JEPA.")
     
     # Print config
     print("="*80)
@@ -280,10 +342,16 @@ def main():
     print(f"Model: {args.model_name}")
     print(f"Train file: {args.train_file}")
     print(f"Output dir: {args.output_dir}")
-    print(f"Step-JEPA mode: {args.step_jepa}")
-    print(f"Lambda (JEPA): {args.lbd}")
-    print(f"Gamma (LM): {args.gamma}")
+    print(f"Mode: {'Regular (No JEPA)' if args.regular else 'Step-JEPA' if args.step_jepa else 'Base RepresentationTrainer'}")
+    if not args.regular:
+        print(f"Lambda (JEPA): {args.lbd}")
+        print(f"Gamma (LM): {args.gamma}")
+        print(f"Last token: {args.last_token}")
+        print(f"Predictors (K): {args.predictors}")
+        if args.step_jepa:
+            print(f"Step-JEPA: Isolate Step 2, K={args.predictors} tokens after Step 1")
     print(f"LoRA: {args.lora}")
+    print(f"Seed: {args.seed}")
     print("="*80)
     
     # Setup distributed training
@@ -305,15 +373,16 @@ def main():
         seed=args.seed
     )
     
-    # Add predictor token if Step-JEPA
+    # Add predictor tokens if Step-JEPA
     if args.step_jepa:
-        special_tokens = ["<|predictor|>"]
+        # Add K predictor tokens (where K = args.predictors)
+        special_tokens = [f"<|predictor_{i+1}|>" for i in range(args.predictors)]
         new_tokens = [token for token in special_tokens if token not in tokenizer.vocab]
         
         if new_tokens:
             tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
             model.resize_token_embeddings(len(tokenizer))
-            print(f"Added predictor token: {new_tokens}")
+            print(f"Added {len(new_tokens)} predictor tokens: {new_tokens}")
     
     # Load dataset
     print("\n2. Loading and preparing dataset...")
@@ -323,7 +392,8 @@ def main():
         args.model_name,
         args.max_length,
         debug=args.debug,
-        regular=False  # We need JEPA fields
+        predictors=args.predictors,
+        regular=args.regular  # Use regular mode if specified
     )
     
     eval_dataset = None
@@ -334,7 +404,8 @@ def main():
             args.model_name,
             args.max_length,
             debug=args.debug,
-            regular=False
+            predictors=args.predictors,
+            regular=args.regular
         )
     
     print(f"Train samples: {len(train_dataset)}")
@@ -384,23 +455,42 @@ def main():
     )
     
     # Initialize Step-JEPA trainer
-    print("\n3. Initializing Step-JEPA trainer...")
-    trainer = StepJEPARepresentationTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        step_jepa=args.step_jepa,
-        lbd=args.lbd,
-        gamma=args.gamma,
-        debug=args.debug if args.debug > 0 else 5,  # Default to 5 for loss logging
-        additive_mask=True,  # Required for Step-JEPA
-        jepa_l2=args.jepa_l2,
-        jepa_mse=args.jepa_mse,
-        infonce=args.infonce,
-    )
+    print("\n3. Initializing trainer...")
+    
+    if args.regular:
+        # Use regular Trainer (no JEPA)
+        from transformers import Trainer
+        print("Using regular Trainer (no JEPA)")
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+        )
+    else:
+        # Use StepJEPARepresentationTrainer
+        print(f"Using StepJEPARepresentationTrainer (step_jepa={args.step_jepa}, K={args.predictors})")
+        trainer = StepJEPARepresentationTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            step_jepa=args.step_jepa,
+            step_jepa_predictors=args.predictors if args.step_jepa else 1,  # K for Step-JEPA
+            lbd=args.lbd,
+            gamma=args.gamma,
+            last_token=args.last_token,
+            debug=args.debug if args.debug > 0 else 5,  # Default to 5 for loss logging
+            additive_mask=True,  # Use additive mask for efficiency
+            jepa_l2=args.jepa_l2,
+            jepa_mse=args.jepa_mse,
+            infonce=args.infonce,
+            jepa_ratio=args.jepa_ratio,
+        )
     
     # Start training
     print("\n4. Starting training...")

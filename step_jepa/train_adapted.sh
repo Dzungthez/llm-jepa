@@ -15,6 +15,7 @@ echo "This uses finetune.py's infrastructure:"
 echo "  - Extends RepresentationTrainer class"
 echo "  - Uses existing JEPA logic"
 echo "  - Adds Step-JEPA specific masking"
+echo "  - Supports K predictor tokens after Step 1"
 echo ""
 
 # Configuration
@@ -32,6 +33,7 @@ MAX_LENGTH=1024
 # Step-JEPA parameters
 LBD=0.1        # JEPA loss weight
 GAMMA=1.0      # LM loss weight
+PREDICTORS=2   # K predictor tokens after Step 1
 
 # LoRA settings
 USE_LORA=1
@@ -48,6 +50,7 @@ CMD="python finetune_step_jepa_adapted.py \
   --grad_accum=$GRAD_ACCUM \
   --max_length=$MAX_LENGTH \
   --step_jepa \
+  --predictors=$PREDICTORS \
   --lbd=$LBD \
   --gamma=$GAMMA"
 
@@ -60,6 +63,8 @@ fi
 
 echo "Command:"
 echo "$CMD"
+echo ""
+echo "K predictor tokens: $PREDICTORS"
 echo ""
 
 # Execute

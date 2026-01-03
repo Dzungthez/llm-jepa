@@ -239,9 +239,10 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         Override to extract embeddings at correct positions for Step-JEPA.
         
         Follows the original finetune.py pattern:
-        - forward_results contains outputs from DOUBLED batch
+        - forward_results contains outputs from DOUBLED batch (if JEPA is not skipped)
         - LM loss is averaged over BOTH halves (normal + JEPA masked)
         - JEPA embeddings extracted from SECOND HALF only
+        - Respects jepa_ratio for selective JEPA loss
         """
         if not self.step_jepa or not self.additive_mask:
             # Use parent's implementation
@@ -251,8 +252,21 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         forward_results = self.forward(model, inputs)
         
         main_outputs = forward_results['main_outputs']
-        lm_loss = main_outputs.loss  # Already averaged over DOUBLED batch (first + second halves)
+        lm_loss = main_outputs.loss
         
+        # Check if JEPA was skipped (due to jepa_ratio)
+        user_hidden_states = forward_results['user_hidden_states']
+        
+        if user_hidden_states is None:
+            # JEPA was skipped, only use LM loss
+            total_loss = lm_loss
+            
+            if self.debug >= 5 and torch.cuda.current_device() == 0:
+                print(f"llm_loss: {lm_loss.float()}, jepa_loss: skipped (jepa_ratio)")
+            
+            return (total_loss, main_outputs) if return_outputs else total_loss
+        
+        # JEPA was not skipped, compute JEPA loss
         # Extract hidden states from the forward pass
         # hidden_states shape: (batch_size * 2, seq_len, hidden_dim)
         hidden_states = main_outputs.hidden_states[-1]

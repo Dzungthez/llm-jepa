@@ -46,6 +46,7 @@ LBD=0.1              # Lambda (JEPA loss weight)
 GAMMA=1.0            # Gamma (LM loss weight)
 PREDICTORS=2         # K predictor tokens after Step 1
 LAST_TOKEN=-1        # Last token offset for embedding extraction
+JEPA_RATIO=-1.0      # JEPA dropout ratio: -1.0=always use JEPA, 0.5=50% chance to skip JEPA, 1.0=never skip JEPA
 
 # Loss type (choose ONE)
 # LOSS_TYPE="cosine"   # Default: 1 - cosine_similarity
@@ -87,7 +88,8 @@ if [ "$MODE" == "regular" ]; then
 elif [ "$MODE" == "step_jepa" ]; then
     echo "Mode: Step-JEPA (Step 1 ↔ Step 2)"
     echo "  K predictor tokens: $PREDICTORS"
-    CMD="$CMD --step_jepa --predictors=$PREDICTORS --lbd=$LBD --gamma=$GAMMA --last_token=$LAST_TOKEN"
+    echo "  JEPA ratio: $JEPA_RATIO (probability to apply JEPA)"
+    CMD="$CMD --step_jepa --predictors=$PREDICTORS --lbd=$LBD --gamma=$GAMMA --last_token=$LAST_TOKEN --jepa_ratio=$JEPA_RATIO"
 else
     echo "❌ Error: Invalid MODE=$MODE. Must be 'regular' or 'step_jepa'"
     exit 1

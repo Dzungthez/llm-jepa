@@ -106,56 +106,15 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         
         return step1_end, step2_end
     
-    def _build_step_jepa_mask(self, seq_len, step1_end_pos, step2_end_pos, num_predictors, device):
-        """
-        Build attention mask for Step-JEPA.
-        
-        Key insight: \n\n is THE representation marker for each step (common in step-based reasoning).
-        
-        Pattern with K predictor tokens:
-        - [0:step1_end+1]: Normal causal (System, User, Step1, \n\n)
-        - [step1_end+1:step1_end+1+K]: K predictor tokens RIGHT AFTER \n\n (normal causal)
-        - [step1_end+1+K:step2_end+1+K]: Step 2 content + \n\n ISOLATED (only see themselves)
-        - [step2_end+1+K:]: Step 3+ normal causal (see everything including Step 2)
-        
-        Embedding extraction:
-        - View 1: h[step1_end + K] = last predictor (predicts Step 2 from Step 1's \n\n)
-        - View 2: h[step2_end + K] = Step 2's \n\n (THE representation of Step 2)
-        
-        Returns:
-            mask: [batch_size, 1, seq_len, seq_len]
-        """
-        batch_size = step1_end_pos.shape[0]
-        
-        # Start with causal mask
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=device) * float('-inf'), diagonal=1)
-        
-        # Expand for batch
-        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len).clone()
-        
-        # For each example, isolate Step 2
-        for i in range(batch_size):
-            step1_end = step1_end_pos[i].item()
-            step2_end = step2_end_pos[i].item()
-            
-            # K predictor tokens go after step1_end
-            predictor_start = step1_end + 1
-            predictor_end = predictor_start + num_predictors - 1
-            step2_start = predictor_end + 1
-            
-            # Adjust step2_end to account for inserted predictors
-            step2_end_adjusted = step2_end + num_predictors
-            
-            # Isolate Step 2: can't see anything before it
-            mask[i, 0, step2_start:step2_end_adjusted+1, :step2_start] = float('-inf')
-            
-            # Step 3+ has normal causal (no additional masking needed)
-        
-        return mask
-    
     def build_with_additive_mask(self, inputs):
         """
         Override parent's method to support Step-JEPA masking.
+        
+        Follows the original finetune.py pattern:
+        1. Insert K predictor tokens after Step 1
+        2. DOUBLE the batch
+        3. First half: Modified tokens + Normal causal mask
+        4. Second half: Modified tokens + Step-JEPA isolation mask
         
         If step_jepa is False, use parent's implementation (default additive_mask from finetune.py).
         If step_jepa is True, apply Step-JEPA attention masking.
@@ -163,6 +122,15 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         if not self.step_jepa:
             # Use parent's default additive_mask logic from finetune.py
             return super().build_with_additive_mask(inputs)
+        
+        # Apply jepa_ratio dropout (same as original)
+        if self.jepa_ratio > 0.0:
+            if torch.rand(1).item() > self.jepa_ratio:
+                return {
+                    "input_ids": inputs["input_ids"],
+                    "labels": inputs["labels"],
+                    "attention_mask": inputs["attention_mask"],
+                }, True  # skip_jepa=True
         
         # Step-JEPA logic
         batch_size = inputs["input_ids"].shape[0]
@@ -196,9 +164,6 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         step2_end_pos = torch.tensor(step2_end_positions, device=device)
         
         # Insert K predictor tokens after Step 1 for each example
-        # We need to modify input_ids to insert the predictor tokens
-        predictor_token_id = self.processing_class.convert_tokens_to_ids("<|predictor_1|>")
-        
         # Create new input_ids with predictor tokens inserted
         new_input_ids = []
         for i in range(batch_size):
@@ -216,25 +181,67 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         
         new_input_ids = torch.stack(new_input_ids)
         
-        # Build Step-JEPA mask
-        mask = self._build_step_jepa_mask(seq_length, step1_end_pos, step2_end_pos, 
-                                         self.step_jepa_predictors, device)
+        # DOUBLE THE BATCH (following original finetune.py pattern)
+        # First half: normal causal mask
+        # Second half: Step-JEPA isolation mask
+        doubled_input_ids = torch.cat([new_input_ids, new_input_ids], dim=0)
+        doubled_labels = torch.cat([inputs["labels"], inputs["labels"]], dim=0)
         
-        # Store for later use in compute_loss
+        # Create attention masks for DOUBLED batch
+        mask = torch.full((batch_size * 2, 1, seq_length, seq_length), float('-inf')).to(device)
+        
+        for i in range(batch_size):
+            step1_end = step1_end_pos[i].item()
+            step2_end = step2_end_pos[i].item()
+            
+            # Calculate positions after inserting K predictor tokens
+            predictor_start = step1_end + 1
+            predictor_end = predictor_start + self.step_jepa_predictors - 1
+            step2_start = predictor_end + 1
+            step2_end_adjusted = step2_end + self.step_jepa_predictors
+            
+            # Find actual sequence length (non-padding)
+            last_token = self._last_token_index(
+                inputs["input_ids"][i:i+1],
+                inputs["labels"][i:i+1],
+                inputs["attention_mask"][i:i+1]
+            )[0].item()
+            seq_len_actual = last_token + 1 + self.step_jepa_predictors  # Adjust for inserted tokens
+            
+            # FIRST HALF (index i): Normal causal mask for entire sequence
+            mask[i, 0, :seq_len_actual, :seq_len_actual] = self._build_additive_mask(seq_len_actual)
+            
+            # SECOND HALF (index i + batch_size): Step-JEPA isolation mask
+            # - Everything before Step 2: normal causal
+            mask[i + batch_size, 0, :step2_start, :step2_start] = self._build_additive_mask(step2_start)
+            # - Step 2: isolated (can only see itself)
+            mask[i + batch_size, 0, step2_start:step2_end_adjusted+1, step2_start:step2_end_adjusted+1] = \
+                self._build_additive_mask(step2_end_adjusted - step2_start + 1)
+            # - Step 3+: normal causal (can see everything)
+            if step2_end_adjusted + 1 < seq_len_actual:
+                mask[i + batch_size, 0, step2_end_adjusted+1:seq_len_actual, :seq_len_actual] = \
+                    self._build_additive_mask(seq_len_actual)[step2_end_adjusted+1:seq_len_actual, :seq_len_actual]
+        
+        # Store positions for later use in compute_loss
+        # These are for the SECOND HALF of the doubled batch
         self._step1_end_pos = step1_end_pos
-        self._step2_end_pos = step2_end_pos + self.step_jepa_predictors  # Adjust for inserted tokens
-        # Extract embedding at LAST predictor token
-        self._predictor_pos = step1_end_pos + self.step_jepa_predictors
+        self._step2_end_pos = step2_end_pos + self.step_jepa_predictors  # Adjusted for inserted tokens
+        self._predictor_pos = step1_end_pos + self.step_jepa_predictors  # Last predictor token
         
         return {
-            "input_ids": new_input_ids,
-            "labels": inputs["labels"],  # Labels stay the same (we don't predict predictor tokens)
-            "attention_mask": mask,
+            "input_ids": doubled_input_ids,      # Shape: (batch_size * 2, seq_len)
+            "labels": doubled_labels,            # Shape: (batch_size * 2, seq_len)
+            "attention_mask": mask,              # Shape: (batch_size * 2, 1, seq_len, seq_len)
         }, False
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         Override to extract embeddings at correct positions for Step-JEPA.
+        
+        Follows the original finetune.py pattern:
+        - forward_results contains outputs from DOUBLED batch
+        - LM loss is averaged over BOTH halves (normal + JEPA masked)
+        - JEPA embeddings extracted from SECOND HALF only
         """
         if not self.step_jepa or not self.additive_mask:
             # Use parent's implementation
@@ -244,15 +251,23 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         forward_results = self.forward(model, inputs)
         
         main_outputs = forward_results['main_outputs']
-        lm_loss = main_outputs.loss
+        lm_loss = main_outputs.loss  # Already averaged over DOUBLED batch (first + second halves)
         
-        # Extract hidden states
-        hidden_states = main_outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
-        batch_size = hidden_states.shape[0]
+        # Extract hidden states from the forward pass
+        # hidden_states shape: (batch_size * 2, seq_len, hidden_dim)
+        hidden_states = main_outputs.hidden_states[-1]
+        total_batch_size = hidden_states.shape[0]
+        original_batch_size = total_batch_size // 2  # Recover original batch size
         
-        # Extract embeddings at predictor position (View 1) and Step 2 end (View 2)
-        view1_embeddings = hidden_states[range(batch_size), self._predictor_pos, :]
-        view2_embeddings = hidden_states[range(batch_size), self._step2_end_pos, :]
+        # Extract embeddings from SECOND HALF only (indices batch_size to batch_size*2)
+        # This is where the Step-JEPA isolation mask was applied
+        jepa_hidden_states = hidden_states[original_batch_size:total_batch_size, :, :]
+        
+        # Extract View 1: Last predictor token's embedding
+        view1_embeddings = jepa_hidden_states[range(original_batch_size), self._predictor_pos, :]
+        
+        # Extract View 2: Step 2's \n\n embedding
+        view2_embeddings = jepa_hidden_states[range(original_batch_size), self._step2_end_pos, :]
         
         # Compute JEPA loss
         if self.jepa_l2:

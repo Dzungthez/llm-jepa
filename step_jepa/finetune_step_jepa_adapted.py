@@ -54,7 +54,7 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
             # Add predictor token to tokenizer if needed
             self.predictor_token = "<|predictor|>"
     
-    def _find_step_boundaries(self, input_ids, tokenizer):
+    def _find_step_boundaries(self, input_ids, processing_class):
         """
         Find positions where Step 1 and Step 2 end by looking for \n\n separators.
         
@@ -64,7 +64,7 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
             Returns None, None if can't find boundaries
         """
         # Tokenize the separator
-        sep_tokens = tokenizer.encode("\n\n", add_special_tokens=False)
+        sep_tokens = processing_class.encode("\n\n", add_special_tokens=False)
         
         # Convert to list for searching
         ids_list = input_ids.tolist()
@@ -151,7 +151,7 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         for i in range(batch_size):
             step1_end, step2_end = self._find_step_boundaries(
                 inputs["input_ids"][i],
-                self.tokenizer
+                self.processing_class
             )
             
             if step1_end is None or step2_end is None:
@@ -226,8 +226,9 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
         
         total_loss = self.gamma * lm_loss + self.lbd * jepa_loss
         
-        if self.debug >= 1 and torch.cuda.current_device() == 0:
-            print(f"LM loss: {lm_loss.item():.4f}, JEPA loss: {jepa_loss.item():.4f}, Total: {total_loss.item():.4f}")
+        # Log losses like original finetune.py (debug level 5)
+        if self.debug >= 5 and torch.cuda.current_device() == 0:
+            print(f"llm_loss: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
         
         return (total_loss, main_outputs) if return_outputs else total_loss
 
@@ -394,7 +395,7 @@ def main():
         step_jepa=args.step_jepa,
         lbd=args.lbd,
         gamma=args.gamma,
-        debug=args.debug,
+        debug=args.debug if args.debug > 0 else 5,  # Default to 5 for loss logging
         additive_mask=True,  # Required for Step-JEPA
         jepa_l2=args.jepa_l2,
         jepa_mse=args.jepa_mse,

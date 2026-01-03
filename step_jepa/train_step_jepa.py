@@ -288,7 +288,7 @@ def main():
         data_collator=data_collator,
         lbd=args.lbd,
         gamma=args.gamma,
-        debug=args.debug,
+        debug=args.debug if args.debug > 0 else 5,  # Default to 5 for loss logging
         jepa_loss_type=args.jepa_loss_type,
     )
     

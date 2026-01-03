@@ -51,6 +51,9 @@ CMD="python finetune_step_jepa_adapted.py \
   --lbd=$LBD \
   --gamma=$GAMMA"
 
+# Note: debug=5 is set by default in the script for loss logging
+# Override with --debug=N if you want different behavior
+
 if [ -n "$USE_LORA" ]; then
     CMD="$CMD --lora --lora_rank=$LORA_RANK"
 fi

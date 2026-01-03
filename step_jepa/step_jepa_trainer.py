@@ -244,8 +244,9 @@ class StepJEPATrainer(Trainer):
         # Total loss
         total_loss = self.gamma * lm_loss + self.lbd * jepa_loss
         
-        if self.debug >= 1 and torch.cuda.current_device() == 0:
-            print(f"LM loss: {lm_loss.item():.4f}, JEPA loss: {jepa_loss.item():.4f}, Total: {total_loss.item():.4f}")
+        # Log losses like original finetune.py
+        if self.debug >= 5 and torch.cuda.current_device() == 0:
+            print(f"llm_loss: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
         
         return (total_loss, outputs_ntp) if return_outputs else total_loss
 

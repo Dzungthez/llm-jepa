@@ -636,7 +636,7 @@ class RepresentationTrainer(Trainer):
                 assistant_hidden_states = user_hidden_states
         else:
             batch_size = llm_inputs["input_ids"].shape[0] // 3
-            user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2]
+            user_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2] # shape: (batch_size, seq_length, hidden_size)
             assistant_hidden_states = outputs.hidden_states[-1][batch_size * 2:]
 
         if self.debug == 2 and torch.cuda.current_device() == 0:
@@ -658,7 +658,7 @@ class RepresentationTrainer(Trainer):
         if not self.additive_mask:
             index_user = self._last_token_index(inputs["input_ids_user"], inputs["labels_user"], inputs["attention_mask_user"])
             index_assistant = self._last_token_index(inputs["input_ids_assistant"], inputs["labels_assistant"], inputs["attention_mask_assistant"])
-        first_dim = inputs["input_ids_user"].shape[0]
+        first_dim = inputs["input_ids_user"].shape[0] # shape: (batch_size)
         if self.debug == 1 and torch.cuda.current_device() == 0:
             print("=====last tokens=====")
             print(inputs["input_ids_user"][range(first_dim), index_user])

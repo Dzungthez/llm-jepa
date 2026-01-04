@@ -177,9 +177,22 @@ class StepJEPARepresentationTrainer(RepresentationTrainer):
                 torch.tensor(predictor_ids, device=device),
                 inputs["input_ids"][i, step1_end+1:]
             ])
-            new_input_ids.append(new_seq[:seq_length])  # Truncate to original length
+            # Don't truncate - let sequences be (seq_length + K) tokens
+            # Most sequences have padding at the end anyway
+            new_input_ids.append(new_seq)
         
-        new_input_ids = torch.stack(new_input_ids)
+        # Stack with padding to handle variable lengths
+        max_len = max(seq.shape[0] for seq in new_input_ids)
+        padded_input_ids = []
+        for seq in new_input_ids:
+            if seq.shape[0] < max_len:
+                padding = torch.full((max_len - seq.shape[0],), 
+                                    self.processing_class.pad_token_id, 
+                                    device=device)
+                seq = torch.cat([seq, padding])
+            padded_input_ids.append(seq)
+        
+        new_input_ids = torch.stack(padded_input_ids)
         
         # DOUBLE THE BATCH (following original finetune.py pattern)
         # First half: normal causal mask
@@ -421,7 +434,7 @@ def main():
         args.model_name,
         args.max_length,
         debug=args.debug,
-        predictors=args.predictors,
+        predictors=0,  # For Step-JEPA: don't add predictors here (added dynamically in build_with_additive_mask)
         regular=args.regular  # Use regular mode if specified
     )
     
@@ -433,7 +446,7 @@ def main():
             args.model_name,
             args.max_length,
             debug=args.debug,
-            predictors=args.predictors,
+            predictors=0,  # For Step-JEPA: don't add predictors here
             regular=args.regular
         )
     
